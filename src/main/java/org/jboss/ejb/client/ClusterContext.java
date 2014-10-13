@@ -28,8 +28,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -46,8 +48,15 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
 
     private static final Logger logger = Logger.getLogger(ClusterContext.class);
 
-    private static final ExecutorService executorService = Executors.newCachedThreadPool(new DaemonThreadFactory("ejb-client-cluster-node-connection-creation"));
+    /** The Executor service used for connecting to cluster nodes in parallel. */
+    private static final ExecutorService parallelExecutorService = Executors.newCachedThreadPool(new DaemonThreadFactory("ejb-client-cluster-node-connection-creation"));
+    /** The Executor service used for connecting to cluster nodes using a single thread. */
+    private static final ExecutorService singleExecutorService = Executors.newSingleThreadExecutor(new DaemonThreadFactory("ejb-client-cluster-node-connection-creation-single"));
+    /** The direct ExecutorService instance, i.e. running on the calling thread.  */
+    private static final ExecutorService directExecutorService = new DirectExecutorService();
 
+    /** The {@link ExecutorService} based on the {@link ConnectionCreationStrategy}. */
+    private final ExecutorService executorService;
     private final String clusterName;
     private final EJBClientContext clientContext;
     private final Map<String, ClusterNodeManager> nodeManagers = Collections.synchronizedMap(new HashMap<String, ClusterNodeManager>());
@@ -63,7 +72,8 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
     private final Set<String> connectedNodes = Collections.synchronizedSet(new HashSet<String>());
 
 
-    ClusterContext(final String clusterName, final EJBClientContext clientContext, final EJBClientConfiguration ejbClientConfiguration) {
+    ClusterContext(final String clusterName, final EJBClientContext clientContext, final EJBClientConfiguration ejbClientConfiguration, final ConnectionCreationStrategy connectionCreationStrategy) {
+        this.executorService = (connectionCreationStrategy != null ? connectionCreationStrategy : ConnectionCreationStrategy.PARALLEL).getExecutorService();
         this.clusterName = clusterName;
         this.clientContext = clientContext;
         if (ejbClientConfiguration != null && ejbClientConfiguration.getClusterConfiguration(this.clusterName) != null) {
@@ -418,4 +428,70 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
 
     }
 
+    /**
+     * Executes the Runnable directly on the calling thread.
+     *
+     * @author kristoffer@cambio.se
+     */
+    private static final class DirectExecutorService extends AbstractExecutorService {
+      private boolean shutdown;
+
+      @Override
+      public void shutdown() {
+        this.shutdown = true;
+      }
+
+      @Override
+      public List<Runnable> shutdownNow() {
+        return Collections.emptyList();
+      }
+
+      @Override
+      public boolean isShutdown() {
+        return this.shutdown;
+      }
+
+      @Override
+      public boolean isTerminated() {
+        return this.isShutdown();
+      }
+
+      @Override
+      public boolean awaitTermination(final long timeout, final TimeUnit unit) throws InterruptedException {
+        this.shutdown();
+        return true;
+      }
+
+      @Override
+      public void execute(final Runnable runnable) {
+        runnable.run();
+      }
+    }
+
+    /**
+     * Defines how to process the connection creation when adding cluster nodes.
+     *
+     * @author kristoffer@cambio.se
+     */
+    public enum ConnectionCreationStrategy {
+      /** The default strategy, connecting in parallel to multiple servers. */
+      PARALLEL,
+      /** Connects using a single thread servers. */
+      SINGLE,
+      /** Connects using the calling thread, one at a time, but without the timeout used for the other strategies. */
+      DIRECT;
+
+      private ExecutorService getExecutorService() {
+        switch(this) {
+        case PARALLEL:
+          return parallelExecutorService;
+        case SINGLE:
+          return singleExecutorService;
+        case DIRECT:
+          return directExecutorService;
+        default:
+          throw new IllegalStateException("Unknown strategy: " + this.name());
+        }
+      }
+    }
 }

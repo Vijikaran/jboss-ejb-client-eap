@@ -105,13 +105,16 @@ public final class EJBClientContext extends Attachable implements Closeable {
     private final Collection<EJBClientContextListener> ejbClientContextListeners = Collections.synchronizedSet(new HashSet<EJBClientContextListener>());
     private volatile boolean closed;
 
-    private EJBClientContext(final EJBClientConfiguration ejbClientConfiguration) {
+    private ClusterContext.ConnectionCreationStrategy connectionCreationStrategy;
+
+    private EJBClientContext(final EJBClientConfiguration ejbClientConfiguration, final ClusterContext.ConnectionCreationStrategy connectionCreationStrategy) {
         this.ejbClientConfiguration = ejbClientConfiguration;
         if (ejbClientConfiguration != null && ejbClientConfiguration.getDeploymentNodeSelector() != null) {
             this.deploymentNodeSelector = ejbClientConfiguration.getDeploymentNodeSelector();
         } else {
             this.deploymentNodeSelector = new RandomDeploymentNodeSelector();
         }
+        this.connectionCreationStrategy = connectionCreationStrategy;
     }
 
     private void init(ClassLoader classLoader) {
@@ -174,20 +177,48 @@ public final class EJBClientContext extends Attachable implements Closeable {
     }
 
     /**
+     * Creates and returns a new client context. The passed <code>ejbClientConfiguration</code> will
+     * be used by this client context during any of the context management activities (like auto-creation
+     * of remoting EJB receivers)
+     * Connections in the cluster will be created using the {@link ClusterContext.ConnectionCreationStrategy#PARALLEL}.
+     *
+     * @param ejbClientConfiguration The EJB client configuration. Can be null.
+     * @return
+     */
+    public static EJBClientContext create(final EJBClientConfiguration ejbClientConfiguration, final ClusterContext.ConnectionCreationStrategy connectionCreationStrategy) {
+      return create(ejbClientConfiguration, EJBClientContext.class.getClassLoader(), null);
+    }
+
+    /**
      * Creates and returns a new client context, using the given class loader to look for initializers.
      * The passed <code>ejbClientConfiguration</code> will be used by this client context during any of
-     * the context management activities (like auto-creation of remoting EJB receivers)
+     * the context management activities (like auto-creation of remoting EJB receivers).
+     * Connections in the cluster will be created using the {@link ClusterContext.ConnectionCreationStrategy#PARALLEL}.
      *
      * @param ejbClientConfiguration The EJB client configuration. Can be null.
      * @param classLoader            The class loader. Cannot be null
      * @return
      */
     public static EJBClientContext create(final EJBClientConfiguration ejbClientConfiguration, final ClassLoader classLoader) {
+      return create(ejbClientConfiguration, classLoader, null);
+    }
+
+    /**
+     * Creates and returns a new client context, using the given class loader to look for initializers.
+     * The passed <code>ejbClientConfiguration</code> will be used by this client context during any of
+     * the context management activities (like auto-creation of remoting EJB receivers)
+     *
+     * @param ejbClientConfiguration     The EJB client configuration. Can be null.
+     * @param classLoader                The class loader. Cannot be null
+     * @param connectionCreationStrategy The connection creation strategy for the cluster context. Can be null.
+     * @return
+     */
+    public static EJBClientContext create(final EJBClientConfiguration ejbClientConfiguration, final ClassLoader classLoader, final ClusterContext.ConnectionCreationStrategy connectionCreationStrategy) {
         final SecurityManager sm = System.getSecurityManager();
         if (sm != null) {
             sm.checkPermission(CREATE_CONTEXT_PERMISSION);
         }
-        final EJBClientContext context = new EJBClientContext(ejbClientConfiguration);
+        final EJBClientContext context = new EJBClientContext(ejbClientConfiguration, connectionCreationStrategy);
         // run it through the initializers
         context.init(classLoader);
         return context;
@@ -928,7 +959,7 @@ public final class EJBClientContext extends Attachable implements Closeable {
 
         ClusterContext clusterContext = this.clusterContexts.get(clusterName);
         if (clusterContext == null) {
-            clusterContext = new ClusterContext(clusterName, this, this.ejbClientConfiguration);
+            clusterContext = new ClusterContext(clusterName, this, this.ejbClientConfiguration, this.connectionCreationStrategy);
             // register a listener which will trigger a notification when nodes are added to the cluster
             clusterContext.registerListener(this.clusterFormationNotifier);
             this.clusterContexts.put(clusterName, clusterContext);

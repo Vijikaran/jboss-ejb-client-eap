@@ -22,6 +22,8 @@
 
 package org.jboss.ejb.client.remoting;
 
+import org.jboss.ejb.client.ClusterContext;
+import org.jboss.ejb.client.ClusterNodeManager;
 import org.jboss.ejb.client.EJBClientConfiguration;
 import org.jboss.ejb.client.EJBClientContext;
 import org.jboss.ejb.client.EJBClientContextIdentifier;
@@ -38,9 +40,8 @@ import org.xnio.OptionMap;
 
 import javax.security.auth.callback.CallbackHandler;
 import java.io.IOException;
-import java.util.ArrayList;
+import java.net.InetAddress;
 import java.util.Iterator;
-import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -53,6 +54,15 @@ import java.util.concurrent.TimeUnit;
 public class ConfigBasedEJBClientContextSelector implements IdentityEJBClientContextSelector {
 
     private static final Logger logger = Logger.getLogger(ConfigBasedEJBClientContextSelector.class);
+    private static final InetAddress localHost;
+
+    static {
+      try {
+        localHost = InetAddress.getLocalHost();
+      } catch(IOException ioe) {
+        throw new IllegalStateException("Unable to fetch localhost", ioe);
+      }
+    }
 
     private final EJBClientConfiguration ejbClientConfiguration;
     private final EJBClientContext ejbClientContext;
@@ -84,12 +94,43 @@ public class ConfigBasedEJBClientContextSelector implements IdentityEJBClientCon
      * @param classLoader The classloader that will be used to {@link EJBClientContext#create(org.jboss.ejb.client.EJBClientConfiguration, ClassLoader) create the EJBClientContext}
      */
     public ConfigBasedEJBClientContextSelector(final EJBClientConfiguration ejbClientConfiguration, final ClassLoader classLoader) {
+      this(ejbClientConfiguration, classLoader, null);
+    }
+
+    /**
+     * Creates a {@link ConfigBasedEJBClientContextSelector} using the passed <code>ejbClientConfiguration</code>.
+     * <p/>
+     * This constructor creates a {@link EJBClientContext} and uses the passed <code>ejbClientConfiguration</code> to create and
+     * associated EJB receivers to that context. If the passed <code>ejbClientConfiguration</code> is null, then this selector will create a {@link EJBClientContext}
+     * without any associated EJB receivers.
+     *
+     * @param ejbClientConfiguration The EJB client configuration to use
+     * @param classLoader The classloader that will be used to {@link EJBClientContext#create(org.jboss.ejb.client.EJBClientConfiguration, ClassLoader) create the EJBClientContext}
+     * @param connectionCreationStrategy The connection creation strategy to use for the cluster. Null allowed.
+     */
+    public ConfigBasedEJBClientContextSelector(final EJBClientConfiguration ejbClientConfiguration, final ClassLoader classLoader, final ClusterContext.ConnectionCreationStrategy connectionCreationStrategy) {
+      this(ejbClientConfiguration, classLoader, connectionCreationStrategy, null);
+    }
+
+    /**
+     * Creates a {@link ConfigBasedEJBClientContextSelector} using the passed <code>ejbClientConfiguration</code>.
+     * <p/>
+     * This constructor creates a {@link EJBClientContext} and uses the passed <code>ejbClientConfiguration</code> to create and
+     * associated EJB receivers to that context. If the passed <code>ejbClientConfiguration</code> is null, then this selector will create a {@link EJBClientContext}
+     * without any associated EJB receivers.
+     *
+     * @param ejbClientConfiguration The EJB client configuration to use
+     * @param classLoader The classloader that will be used to {@link EJBClientContext#create(org.jboss.ejb.client.EJBClientConfiguration, ClassLoader) create the EJBClientContext}
+     * @param connectionCreationStrategy The connection creation strategy to use for the cluster. Null allowed.
+     * @param intializer The Initializer to use or null for default. Null allowed.
+     */
+    public ConfigBasedEJBClientContextSelector(final EJBClientConfiguration ejbClientConfiguration, final ClassLoader classLoader, final ClusterContext.ConnectionCreationStrategy connectionCreationStrategy, final ConfigBasedEJBClientContextSelector.Initializer initializer) {
         this.ejbClientConfiguration = ejbClientConfiguration;
         // create a empty context
         if (classLoader == null) {
-            this.ejbClientContext = EJBClientContext.create(this.ejbClientConfiguration);
+            this.ejbClientContext = EJBClientContext.create(this.ejbClientConfiguration, connectionCreationStrategy);
         } else {
-            this.ejbClientContext = EJBClientContext.create(this.ejbClientConfiguration, classLoader);
+            this.ejbClientContext = EJBClientContext.create(this.ejbClientConfiguration, classLoader, connectionCreationStrategy);
         }
         // register a EJB client context listener which we will use to close endpoints/connections that we created,
         // when the EJB client context closes
@@ -102,7 +143,7 @@ public class ConfigBasedEJBClientContextSelector implements IdentityEJBClientCon
             return;
         }
         try {
-            this.setupEJBReceivers();
+            (initializer != null ? initializer : new DefaultInitializer()).initialize(this, this.ejbClientContext);
         } catch (IOException ioe) {
             logger.warn("EJB client context " + this.ejbClientContext + " will have no EJB receivers due to an error setting up EJB receivers", ioe);
         }
@@ -111,62 +152,6 @@ public class ConfigBasedEJBClientContextSelector implements IdentityEJBClientCon
     @Override
     public EJBClientContext getCurrent() {
         return this.ejbClientContext;
-    }
-
-    private void setupEJBReceivers() throws IOException {
-        if (!this.ejbClientConfiguration.getConnectionConfigurations().hasNext()) {
-            // no connections configured so no EJB receivers to create
-            return;
-        }
-        // create the endpoint
-        final Endpoint endpoint = Remoting.createEndpoint(this.ejbClientConfiguration.getEndpointName(), this.ejbClientConfiguration.getEndpointCreationOptions());
-        // Keep track of this endpoint for closing on shutdown/client context close
-        this.trackEndpoint(endpoint);
-
-        // register the remote connection provider
-        final OptionMap remoteConnectionProviderOptions = this.ejbClientConfiguration.getRemoteConnectionProviderCreationOptions();
-        endpoint.addConnectionProvider("remote", new RemoteConnectionProviderFactory(), remoteConnectionProviderOptions);
-
-        final Iterator<EJBClientConfiguration.RemotingConnectionConfiguration> connectionConfigurations = this.ejbClientConfiguration.getConnectionConfigurations();
-        final List<Connection> connections = new ArrayList<Connection>();
-        int successfulEJBReceiverRegistrations = 0;
-        while (connectionConfigurations.hasNext()) {
-            ReconnectHandler reconnectHandler = null;
-            final EJBClientConfiguration.RemotingConnectionConfiguration connectionConfiguration = connectionConfigurations.next();
-            final String host = connectionConfiguration.getHost();
-            final int port = connectionConfiguration.getPort();
-            try {
-                final OptionMap connectionCreationOptions = connectionConfiguration.getConnectionCreationOptions();
-                final CallbackHandler callbackHandler = connectionConfiguration.getCallbackHandler();
-                // create a re-connect handler (which will be used on connection breaking down)
-                final int MAX_RECONNECT_ATTEMPTS = 65535; // TODO: Let's keep this high for now and later allow configuration and a smaller default value
-                reconnectHandler = new EJBClientContextConnectionReconnectHandler(ejbClientContext, endpoint, host, port, connectionCreationOptions, callbackHandler, connectionConfiguration.getChannelCreationOptions(), MAX_RECONNECT_ATTEMPTS,
-                        connectionConfiguration.getConnectionTimeout(), TimeUnit.MILLISECONDS);
-
-                final IoFuture<Connection> futureConnection = NetworkUtil.connect(endpoint, host, port, null, connectionCreationOptions, callbackHandler, null);
-                // wait for the connection to be established
-                final Connection connection = IoFutureHelper.get(futureConnection, connectionConfiguration.getConnectionTimeout(), TimeUnit.MILLISECONDS);
-                // keep track of the created connection for auto-close on shutdown/client context close
-                this.trackConnection(connection);
-
-                // create a remoting EJB receiver for this connection
-                final EJBReceiver remotingEJBReceiver = new RemotingConnectionEJBReceiver(connection, reconnectHandler, connectionConfiguration.getChannelCreationOptions());
-                // associate it with the client context
-                this.ejbClientContext.registerEJBReceiver(remotingEJBReceiver);
-                // keep track of successful registrations for logging purposes
-                successfulEJBReceiverRegistrations++;
-            } catch (Exception e) {
-                // just log the warn but don't throw an exception. Move onto the next connection configuration (if any)
-                logger.warn("Could not register a EJB receiver for connection to " + host + ":" + port, e);
-                // add a reconnect handler for this connection
-                if (reconnectHandler != null) {
-                    this.ejbClientContext.registerReconnectHandler(reconnectHandler);
-                    logger.debug("Registered a reconnect handler in EJB client context " + this.ejbClientContext + " for remote://" + host + ":" + port);
-                }
-
-            }
-        }
-        logger.debug("Registered " + successfulEJBReceiverRegistrations + " remoting EJB receivers for EJB client context " + this.ejbClientContext);
     }
 
     private void trackEndpoint(final Endpoint endpoint) {
@@ -209,5 +194,111 @@ public class ConfigBasedEJBClientContextSelector implements IdentityEJBClientCon
     @Override
     public EJBClientContext getContext(final EJBClientContextIdentifier identifier) {
         return this.identifiableContexts.get(identifier);
+    }
+
+    /**
+     * Initializes the {@link ConfigBasedEJBClientContextSelector}, e.g. setting up {@link EJBReceiver}s.
+     *
+     * @author kristoffer@cambio.se
+     */
+    public abstract static class Initializer {
+      /**
+       * Creates an {@link Endpoint} based on the supplied paramaters, and tracks the created instance.
+       */
+      protected Endpoint createEndpoint(final ConfigBasedEJBClientContextSelector selector, final String endpointName, final OptionMap endpointCreationOptions, final OptionMap remoteConnectionProviderOptions) throws IOException {
+        // create the endpoint
+        final Endpoint endpoint = Remoting.createEndpoint(endpointName, endpointCreationOptions);
+        // Keep track of this endpoint for closing on shutdown/client context close
+        selector.trackEndpoint(endpoint);
+        // register the remote connection provider
+        endpoint.addConnectionProvider("remote", new RemoteConnectionProviderFactory(), remoteConnectionProviderOptions);
+        return endpoint;
+      }
+
+      /**
+       * Creates a {@link Connection} using the supplied parameters and tracks the {@link Connection}.
+       */
+      protected Connection createConnection(final ConfigBasedEJBClientContextSelector selector, final Endpoint endpoint, final String host, final int port, final OptionMap createOptions, final long connectionTimeout, final CallbackHandler callbackHandler) throws IOException {
+        final IoFuture<Connection> futureConnection = NetworkUtil.connect(endpoint, host, port, null, createOptions, callbackHandler, null);
+        // wait for the connection to be established
+        final Connection connection = IoFutureHelper.get(futureConnection, connectionTimeout, TimeUnit.MILLISECONDS);
+        // keep track of the created connection for auto-close on shutdown/client context close
+        selector.trackConnection(connection);
+        return connection;
+      }
+
+      /**
+       * Creates a {@link ClusterNodeManager} using the supplied parameters, with a {@link ClusterNode} with a single {@link ClientMapping} using localhost as sourceNetworkAddress and zero as sourceNetworkMaskBits.
+       */
+      protected ClusterNodeManager createClusterNodeManager(final ConfigBasedEJBClientContextSelector selector, final ClusterContext clusterContext, final String clusterName, final String nodeName, final String destinationAddress, final int destinationPort, final Endpoint endpoint, final EJBClientConfiguration ejbClientConfiguration) {
+        return createClusterNodeManager(selector, clusterContext, clusterName, nodeName, new ClientMapping[] { new ClientMapping(localHost, 0, destinationAddress, destinationPort) }, endpoint, ejbClientConfiguration);
+      }
+
+      /**
+       * Creates a {@link ClusterNodeManager} using the supplied parameters.
+       */
+      protected ClusterNodeManager createClusterNodeManager(final ConfigBasedEJBClientContextSelector selector, final ClusterContext clusterContext, final String clusterName, final String nodeName, final ClientMapping[] clientMappings, final Endpoint endpoint, final EJBClientConfiguration ejbClientConfiguration) {
+        return new RemotingConnectionClusterNodeManager(clusterContext, new ClusterNode(clusterName, nodeName, clientMappings), endpoint, ejbClientConfiguration);
+      }
+
+      /**
+       * Initializes the {@link ConfigBasedEJBClientContextSelector}, e.g. creating {@link EJBReceiver}s.
+       */
+      public abstract void initialize(final ConfigBasedEJBClientContextSelector selector, final EJBClientContext ejbClientContext) throws IOException;
+    }
+
+    /**
+     * The default {@link Initializer}, creating initial connections to connect to the cluster, before receiving a cluster view.
+     *
+     * @author kristoffer@cambio.se
+     */
+    protected static class DefaultInitializer extends Initializer {
+      public DefaultInitializer() {
+      }
+
+      @Override
+      public void initialize(final ConfigBasedEJBClientContextSelector selector, final EJBClientContext ejbClientContext) throws IOException {
+          final EJBClientConfiguration ejbClientConfiguration = ejbClientContext.getEJBClientConfiguration();
+
+          if (!ejbClientConfiguration.getConnectionConfigurations().hasNext()) {
+            // no connections configured so no EJB receivers to create
+            return;
+          }
+
+          final Endpoint endpoint = this.createEndpoint(selector, ejbClientConfiguration.getEndpointName(), ejbClientConfiguration.getEndpointCreationOptions(), ejbClientConfiguration.getRemoteConnectionProviderCreationOptions());
+          final Iterator<EJBClientConfiguration.RemotingConnectionConfiguration> connectionConfigurations = ejbClientConfiguration.getConnectionConfigurations();
+          int successfulEJBReceiverRegistrations = 0;
+          while (connectionConfigurations.hasNext()) {
+              ReconnectHandler reconnectHandler = null;
+              final EJBClientConfiguration.RemotingConnectionConfiguration connectionConfiguration = connectionConfigurations.next();
+              final String host = connectionConfiguration.getHost();
+              final int port = connectionConfiguration.getPort();
+              try {
+                  final OptionMap connectionCreationOptions = connectionConfiguration.getConnectionCreationOptions();
+                  final CallbackHandler callbackHandler = connectionConfiguration.getCallbackHandler();
+                  // create a re-connect handler (which will be used on connection breaking down)
+                  final int MAX_RECONNECT_ATTEMPTS = 65535; // TODO: Let's keep this high for now and later allow configuration and a smaller default value
+                  reconnectHandler = new EJBClientContextConnectionReconnectHandler(ejbClientContext, endpoint, host, port, connectionCreationOptions, callbackHandler, connectionConfiguration.getChannelCreationOptions(), MAX_RECONNECT_ATTEMPTS,
+                          connectionConfiguration.getConnectionTimeout(), TimeUnit.MILLISECONDS);
+
+                  final Connection connection = this.createConnection(selector, endpoint, host, port, connectionCreationOptions, connectionConfiguration.getConnectionTimeout(), callbackHandler);
+                  // create a remoting EJB receiver for this connection
+                  final EJBReceiver remotingEJBReceiver = new RemotingConnectionEJBReceiver(connection, reconnectHandler, connectionConfiguration.getChannelCreationOptions());
+                  // associate it with the client context
+                  ejbClientContext.registerEJBReceiver(remotingEJBReceiver);
+                  // keep track of successful registrations for logging purposes
+                  successfulEJBReceiverRegistrations++;
+              } catch (Exception e) {
+                  // just log the warn but don't throw an exception. Move onto the next connection configuration (if any)
+                  logger.warn("Could not register a EJB receiver for connection to " + host + ":" + port, e);
+                  // add a reconnect handler for this connection
+                  if (reconnectHandler != null) {
+                      ejbClientContext.registerReconnectHandler(reconnectHandler);
+                      logger.debug("Registered a reconnect handler in EJB client context " + ejbClientContext + " for remote://" + host + ":" + port);
+                  }
+              }
+          }
+          logger.debug("Registered " + successfulEJBReceiverRegistrations + " remoting EJB receivers for EJB client context " + ejbClientContext);
+        }
     }
 }
