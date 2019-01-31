@@ -171,7 +171,7 @@ final class RemotingEJBDiscoveryProvider implements DiscoveryProvider, Discovere
                 if (maxConnections <= 0) break;
 
                 // Let the ClusterNodeSelector determine which node to connect to
-                final String nodeName = clusterNodeSelector.selectNode(clusterName, EMPTY_NODE_NAMES, nodeSet.toArray(new String[nodes.size()]));
+                final String nodeName = clusterNodeSelector.selectNode(clusterName, EMPTY_NODE_NAMES, nodeSet.toArray(new String[nodeSet.size()]));
                 nodeSet.remove(nodeName);
 
                 final NodeInformation nodeInformation = nodes.get(nodeName);
