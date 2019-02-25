@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLContext;
 
 import org.jboss.ejb._private.Logs;
-import org.jboss.ejb.client.ClusterNodeSelector;
+import org.jboss.ejb.client.DiscoveryNodeSelector;
 import org.jboss.ejb.client.EJBClientCluster;
 import org.jboss.ejb.client.EJBClientConnection;
 import org.jboss.ejb.client.EJBClientContext;
@@ -78,8 +78,6 @@ import org.xnio.OptionMap;
  * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
  */
 final class RemotingEJBDiscoveryProvider implements DiscoveryProvider, DiscoveredNodeRegistry {
-    private static final String[] EMPTY_NODE_NAMES = new String[] {};
-
     static final AuthenticationContextConfigurationClient AUTH_CONFIGURATION_CLIENT = doPrivileged(AuthenticationContextConfigurationClient.ACTION);
 
     private final ConcurrentHashMap<String, NodeInformation> nodes = new ConcurrentHashMap<>();
@@ -164,14 +162,14 @@ final class RemotingEJBDiscoveryProvider implements DiscoveryProvider, Discovere
             }
 
             final EJBClientCluster configuredCluster = ejbClientContext.getInitialConfiguredCluster(clusterName);
-            final ClusterNodeSelector configuredClusterNodeSelector = (configuredCluster != null ? configuredCluster.getClusterNodeSelector() : null);
-            final ClusterNodeSelector clusterNodeSelector = (configuredClusterNodeSelector != null ? configuredClusterNodeSelector : ClusterNodeSelector.FIRST_AVAILABLE);
+            final DiscoveryNodeSelector configuredDiscoveryNodeSelector = (configuredCluster != null ? configuredCluster.getDiscoveryNodeSelector() : null);
+            final DiscoveryNodeSelector discoveryNodeSelector = (configuredDiscoveryNodeSelector != null ? configuredDiscoveryNodeSelector : DiscoveryNodeSelector.FIRST_AVAILABLE);
             int maxConnections = ejbClientContext.getMaximumConnectedClusterNodes();
             nodeLoop: do {
                 if (maxConnections <= 0) break;
 
                 // Let the ClusterNodeSelector determine which node to connect to
-                final String nodeName = clusterNodeSelector.selectNode(clusterName, EMPTY_NODE_NAMES, nodeSet.toArray(new String[nodeSet.size()]));
+                final String nodeName = discoveryNodeSelector.selectNode(clusterName, nodeSet.toArray(new String[nodeSet.size()]));
                 nodeSet.remove(nodeName);
 
                 final NodeInformation nodeInformation = nodes.get(nodeName);
